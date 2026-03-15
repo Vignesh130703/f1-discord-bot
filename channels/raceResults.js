@@ -1,94 +1,92 @@
 // ─────────────────────────────────────────────
 //  CHANNEL: RACE RESULTS  (v5)
-//  • Each round posts as a NEW message (history stays)
-//  • Previous rounds remain in the channel forever
-//  • Qualifying + Sprint + Practice also supported
-//  • Store key uses round number so each race = unique message
+//  • One message showing current race + previous 2
+//  • Edits same message every new race
+//  • History always visible in the embed
 // ─────────────────────────────────────────────
 
 const { EmbedBuilder } = require('discord.js');
-const { ERGAST, get, fetchChannel, flag, posIcon, teamDot } = require('../utils/helpers');
-const { loadStore, saveStore } = require('../utils/messageStore');
+const { ERGAST, get, fetchChannel, flag, teamDot } = require('../utils/helpers');
+const updateMessage = require('../utils/updateMessage');
 
-// ── Send or edit a per-round message ─────────────────────────────
-// Uses storeKey = e.g. "raceResult_2026_5" so each round gets its own message
-async function sendRoundMessage(client, channelId, storeKey, payload) {
-  const ch = await fetchChannel(client, channelId);
-  if (!ch) return;
-
-  const store = loadStore();
-
-  if (store[storeKey]) {
-    try {
-      const existing = await ch.messages.fetch(store[storeKey]);
-      await existing.edit(payload);
-      return;
-    } catch {
-      // message gone — fall through to send new
-      delete store[storeKey];
-      saveStore(store);
-    }
-  }
-
-  // New message for this round
-  const msg = await ch.send(payload);
-  store[storeKey] = msg.id;
-  saveStore(store);
+// ── Fetch a specific round's results ─────────────────────────────
+async function fetchRoundResult(season, round) {
+  try {
+    const data = await get(`${ERGAST}/${season}/${round}/results.json`);
+    return data?.MRData?.RaceTable?.Races?.[0] ?? null;
+  } catch { return null; }
 }
 
-// ── Race Result ───────────────────────────────────────────────────
+// ── Build a compact result block for one race ─────────────────────
+function buildResultBlock(race) {
+  const cFlag = flag(race.Circuit.Location.country);
+
+  const rows = race.Results.map(r => {
+    const pos    = String(r.position).padStart(2);
+    const code   = (r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase()).padEnd(4);
+    const dot    = teamDot(r.Constructor.name);
+    const pts    = String(r.points).padStart(3);
+    const time   = r.position === '1'
+      ? (r.Time?.time ?? r.status ?? '—')
+      : (r.Time?.time ? `+${r.Time.time}` : r.status ?? '—');
+    return `${pos}  ${code} ${dot}  ${pts}pts  ${time}`;
+  });
+
+  const top    = rows.slice(0, 10).join('\n');
+  const rest   = rows.slice(10).join('\n');
+  const winner = race.Results[0];
+  const fl     = race.Results.find(r => r.FastestLap?.rank === '1');
+
+  return {
+    name: `${cFlag} Round ${race.round} — ${race.raceName}`,
+    value:
+      `🏆 **${winner.Driver.givenName} ${winner.Driver.familyName}** *(${winner.Constructor.name})*\n` +
+      `⚡ FL: **${fl ? `${fl.Driver.familyName} — ${fl.FastestLap.Time.time}` : '—'}**\n` +
+      `\`\`\`\n${top}\n\n${rest}\n\`\`\``,
+    inline: false,
+  };
+}
+
+// ── Main: current + prev 2 races in one message ───────────────────
 async function postRaceResults(client, channelId) {
   if (!channelId) return;
 
-  const data = await get(`${ERGAST}/current/last/results.json`);
-  const race = data?.MRData?.RaceTable?.Races?.[0];
-  if (!race || !race.Results?.length) return;
+  const latestData = await get(`${ERGAST}/current/last/results.json`);
+  const latestRace = latestData?.MRData?.RaceTable?.Races?.[0];
+  if (!latestRace || !latestRace.Results?.length) return;
 
-  const season  = data.MRData.RaceTable.season;
-  const round   = race.round;
-  const cFlag   = flag(race.Circuit.Location.country);
+  const season      = latestData.MRData.RaceTable.season;
+  const latestRound = parseInt(latestRace.round);
 
-  // Top 10
-  const topRows = race.Results.slice(0, 10).map(r => {
-    const code = r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase();
-    const pts  = String(r.points).padStart(3);
-    const time = r.position === '1'
-      ? (r.Time?.time ?? '—')
-      : (r.Time?.time ? `+${r.Time.time}` : r.status ?? '—');
-    return `${String(r.position).padStart(2)}  ${code.padEnd(4)} ${teamDot(r.Constructor.name)}  ${pts}pts  ${time}`;
-  });
+  // Fetch previous 2 rounds in parallel
+  const [prev1, prev2] = await Promise.all([
+    latestRound >= 2 ? fetchRoundResult(season, latestRound - 1) : null,
+    latestRound >= 3 ? fetchRoundResult(season, latestRound - 2) : null,
+  ]);
 
-  // Rest (11–20)
-  const restRows = race.Results.slice(10).map(r => {
-    const code   = r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase();
-    const status = r.Time?.time ? `+${r.Time.time}` : r.status ?? '—';
-    return `${String(r.position).padStart(2)}  ${code.padEnd(4)} ${teamDot(r.Constructor.name)}  ${status}`;
-  });
+  // Build fields: oldest → newest
+  const fields = [];
+  if (prev2) fields.push(buildResultBlock(prev2));
+  if (prev1) fields.push(buildResultBlock(prev1));
+  fields.push(buildResultBlock(latestRace));
 
-  const winner = race.Results[0];
-  const flHolder = race.Results.find(r => r.FastestLap?.rank === '1');
+  const winner = latestRace.Results[0];
+  const cFlag  = flag(latestRace.Circuit.Location.country);
 
   const embed = new EmbedBuilder()
     .setColor(0xE10600)
-    .setAuthor({ name: `🏎️ FORMULA 1 · ${season} SEASON · ROUND ${round}` })
-    .setTitle(`🏁 ${cFlag} ${race.raceName.toUpperCase()} — RACE RESULT`)
+    .setAuthor({ name: `🏎️ FORMULA 1 · ${season} SEASON` })
+    .setTitle(`🏁 Race Results — Last ${fields.length} Round${fields.length > 1 ? 's' : ''}`)
     .setDescription(
-      `📍 **${race.Circuit.circuitName}**\n` +
-      `🌍 ${race.Circuit.Location.locality}, **${race.Circuit.Location.country}**\n\n` +
+      `**Latest:** ${cFlag} Round ${latestRace.round} — ${latestRace.raceName}\n` +
       `🏆 **Winner:** ${winner.Driver.givenName} ${winner.Driver.familyName} *(${winner.Constructor.name})*\n` +
-      `⚡ **Fastest Lap:** ${flHolder ? `${flHolder.Driver.givenName} ${flHolder.Driver.familyName} — ${flHolder.FastestLap.Time.time}` : '—'}`
+      `📍 ${latestRace.Circuit.circuitName}`
     )
-    .addFields(
-      {
-        name: 'Results',
-        value: `\`\`\`\n${topRows.join('\n')}\n\n${restRows.join('\n')}\n\`\`\``,
-        inline: false,
-      }
-    )
+    .addFields(...fields)
     .setTimestamp()
-    .setFooter({ text: `Round ${round} · ${season} Season · Jolpica API` });
+    .setFooter({ text: `Shows last ${fields.length} races · Updates after each race · Jolpica API` });
 
-  await sendRoundMessage(client, channelId, `raceResult_${season}_${round}`, { embeds: [embed] });
+  await updateMessage(client, channelId, 'raceResults', { embeds: [embed] });
 }
 
 // ── Qualifying Result ─────────────────────────────────────────────
@@ -104,12 +102,13 @@ async function postQualifyingResult(client, channelId) {
   const cFlag  = flag(race.Circuit.Location.country);
 
   const rows = race.QualifyingResults.map(r => {
-    const code = r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase();
-    const best = r.Q3 ?? r.Q2 ?? r.Q1 ?? '—';
-    const q1   = r.Q1 ?? '—';
-    const q2   = r.Q2 ?? '—';
-    const q3   = r.Q3 ?? '—';
-    return `${String(r.position).padStart(2)}  ${code.padEnd(4)} ${teamDot(r.Constructor.name)}  ${best.padEnd(10)}  Q1:${q1}  Q2:${q2}  Q3:${q3}`;
+    const pos  = String(r.position).padStart(2);
+    const code = (r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase()).padEnd(4);
+    const dot  = teamDot(r.Constructor.name);
+    const best = (r.Q3 ?? r.Q2 ?? r.Q1 ?? '—').padEnd(10);
+    const q2   = r.Q2 ? `  Q2:${r.Q2}` : '';
+    const q3   = r.Q3 ? `  Q3:${r.Q3}` : '';
+    return `${pos}  ${code} ${dot}  Q1:${r.Q1 ?? '—'}${q2}${q3}  best:${best}`;
   });
 
   const pole = race.QualifyingResults[0];
@@ -120,16 +119,13 @@ async function postQualifyingResult(client, channelId) {
     .setTitle(`⏱️ ${cFlag} ${race.raceName.toUpperCase()} — QUALIFYING`)
     .setDescription(
       `📍 **${race.Circuit.circuitName}**\n\n` +
-      `🥇 **Pole:** ${pole.Driver.givenName} ${pole.Driver.familyName} — ${pole.Q3 ?? pole.Q2 ?? pole.Q1}`
+      `🥇 **Pole:** ${pole.Driver.givenName} ${pole.Driver.familyName} *(${pole.Constructor.name})* — ${pole.Q3 ?? pole.Q2 ?? pole.Q1}`
     )
-    .addFields({
-      name: 'Results',
-      value: `\`\`\`\n${rows.join('\n')}\n\`\`\``,
-    })
+    .addFields({ name: 'Full Grid', value: `\`\`\`\n${rows.join('\n')}\n\`\`\`` })
     .setTimestamp()
     .setFooter({ text: `Round ${round} Qualifying · ${season} Season` });
 
-  await sendRoundMessage(client, channelId, `qualifyingResult_${season}_${round}`, { embeds: [embed] });
+  await updateMessage(client, channelId, `quali_${season}_${round}`, { embeds: [embed] });
 }
 
 // ── Sprint Result ─────────────────────────────────────────────────
@@ -145,10 +141,12 @@ async function postSprintResult(client, channelId) {
   const cFlag  = flag(race.Circuit.Location.country);
 
   const rows = race.SprintResults.map(r => {
-    const code   = r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase();
+    const pos    = String(r.position).padStart(2);
+    const code   = (r.Driver.code ?? r.Driver.familyName.slice(0, 3).toUpperCase()).padEnd(4);
+    const dot    = teamDot(r.Constructor.name);
     const pts    = String(r.points).padStart(2);
     const status = r.Time?.time ? `+${r.Time.time}` : r.status ?? '—';
-    return `${String(r.position).padStart(2)}  ${code.padEnd(4)} ${teamDot(r.Constructor.name)}  ${pts}pts  ${status}`;
+    return `${pos}  ${code} ${dot}  ${pts}pts  ${status}`;
   });
 
   const winner = race.SprintResults[0];
@@ -157,20 +155,15 @@ async function postSprintResult(client, channelId) {
     .setColor(0xFF6600)
     .setAuthor({ name: `🏎️ FORMULA 1 · ${season} SEASON · ROUND ${round}` })
     .setTitle(`🏃 ${cFlag} ${race.raceName.toUpperCase()} — SPRINT`)
-    .setDescription(
-      `🏆 **Winner:** ${winner.Driver.givenName} ${winner.Driver.familyName} *(${winner.Constructor.name})*`
-    )
-    .addFields({
-      name: 'Results',
-      value: `\`\`\`\n${rows.join('\n')}\n\`\`\``,
-    })
+    .setDescription(`🏆 **Winner:** ${winner.Driver.givenName} ${winner.Driver.familyName} *(${winner.Constructor.name})*`)
+    .addFields({ name: 'Results', value: `\`\`\`\n${rows.join('\n')}\n\`\`\`` })
     .setTimestamp()
     .setFooter({ text: `Round ${round} Sprint · ${season} Season` });
 
-  await sendRoundMessage(client, channelId, `sprintResult_${season}_${round}`, { embeds: [embed] });
+  await updateMessage(client, channelId, `sprint_${season}_${round}`, { embeds: [embed] });
 }
 
-// ── Practice Result (placeholder — Ergast doesn't have FP timing) ─
+// ── Practice placeholder ──────────────────────────────────────────
 async function postPracticeResult(client, channelId, session = 1) {
   if (!channelId) return;
   const ch = await fetchChannel(client, channelId);
@@ -179,24 +172,10 @@ async function postPracticeResult(client, channelId, session = 1) {
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle(`🔧 Free Practice ${session} — Completed`)
-    .setDescription(`Practice ${session} has ended. Full timing available on the official F1 app.`)
+    .setDescription(`Practice ${session} has ended. Full timing available on the F1 app.`)
     .setTimestamp();
 
-  const { loadStore, saveStore } = require('../utils/messageStore');
-  const store = loadStore();
-  const key   = `fp${session}Result`;
-
-  if (store[key]) {
-    try {
-      const existing = await ch.messages.fetch(store[key]);
-      await existing.edit({ embeds: [embed] });
-      return;
-    } catch { delete store[key]; saveStore(store); }
-  }
-
-  const msg = await ch.send({ embeds: [embed] });
-  store[key] = msg.id;
-  saveStore(store);
+  await updateMessage(client, channelId, `fp${session}`, { embeds: [embed] });
 }
 
 module.exports = { postRaceResults, postQualifyingResult, postSprintResult, postPracticeResult };
