@@ -1,18 +1,7 @@
-// ─────────────────────────────────────────────
-//  CHANNEL: SESSION ALERTS  (v4)
-//  • Fires at 60 min, 30 min, 5 min before session
-//  • Tags @everyone in each alert
-//  • EDITS the same message (no new message per alert)
-//  • Shows a live countdown to session start
-//  • Prevents duplicate fires per session+window
-// ─────────────────────────────────────────────
-
 const { EmbedBuilder } = require('discord.js');
 const { ERGAST, get, fetchChannel, flag } = require('../utils/helpers');
 const { loadStore, saveStore } = require('../utils/messageStore');
-const updateMessage = require('../utils/updateMessage');
 
-// Track which (round-session-window) combos have been sent
 const sentAlerts = new Set();
 
 const SESSION_THEME = {
@@ -24,11 +13,11 @@ const SESSION_THEME = {
   RACE:       { emoji: '🏁', color: 0xE10600, label: 'GRAND PRIX RACE',   tip: 'Lights out and away we go! 🔥' },
 };
 
-// Alert windows: fires at these minute offsets before session
+// Three alert windows per session
 const ALERT_WINDOWS = [
-  { mins: 60, label: '1 HOUR'   },
-  { mins: 30, label: '30 MINUTES' },
-  { mins: 5,  label: '5 MINUTES' },
+  { mins: 60, label: '1 HOUR'      },
+  { mins: 30, label: '30 MINUTES'  },
+  { mins: 5,  label: '5 MINUTES'   },
 ];
 
 async function checkSessionAlerts(client, channelId) {
@@ -50,16 +39,16 @@ async function checkSessionAlerts(client, channelId) {
     { key: 'RACE',       date: { date: race.date, time: race.time } },
   ];
 
-  const now    = Date.now();
-  const cFlag  = flag(race.Circuit.Location.country);
+  const now   = Date.now();
+  const cFlag = flag(race.Circuit.Location.country);
 
   for (const s of sessions) {
     if (!s.date) continue;
 
-    const st = new Date(`${s.date.date}T${s.date.time ?? '00:00:00Z'}`).getTime();
+    const st       = new Date(`${s.date.date}T${s.date.time ?? '00:00:00Z'}`).getTime();
     const diffMins = (st - now) / 60000;
 
-    // Find which window we're in (within 1-min tolerance)
+    // Find matching alert window (±1 min tolerance)
     const window = ALERT_WINDOWS.find(w => diffMins >= w.mins - 1 && diffMins < w.mins + 1);
     if (!window) continue;
 
@@ -87,21 +76,20 @@ async function checkSessionAlerts(client, channelId) {
       .setTimestamp()
       .setFooter({ text: `${window.label} warning · F1 Bot Session Alerts` });
 
-    // Edit the SAME alert message — only a new @everyone ping if it's the 60-min one
-    const storeKey = `alert-${race.round}-${s.key}`;
     const payload = {
       content: `@everyone\n\n${theme.emoji} **${theme.label}** starts in **${window.label}**!`,
       embeds: [embed],
     };
 
-    const store = loadStore();
+    // Edit same message per session (no flood of new messages)
+    const store    = loadStore();
+    const storeKey = `alert-${race.round}-${s.key}`;
 
     if (store[storeKey]) {
       try {
         const existing = await ch.messages.fetch(store[storeKey]);
         await existing.edit(payload);
       } catch {
-        // message gone — send new
         const msg = await ch.send(payload);
         store[storeKey] = msg.id;
         saveStore(store);
@@ -112,7 +100,14 @@ async function checkSessionAlerts(client, channelId) {
       saveStore(store);
     }
 
-    console.log(`[Alert] ${theme.label} — ${window.label} warning sent/updated`);
+    // Log ONLY when alert actually fires — not every cron tick
+    const { logAction } = require('./logger');
+    await logAction(
+      `🔔 **Alert sent** — ${theme.label}`,
+      `${window.label} warning · ${race.raceName}`
+    );
+
+    console.log(`[Alert] ${theme.label} — ${window.label} sent`);
   }
 }
 

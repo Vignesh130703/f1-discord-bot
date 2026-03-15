@@ -1,7 +1,3 @@
-// ════════════════════════════════════════════════════════════════
-//  F1 DISCORD BOT  —  index.js  (v5)
-// ════════════════════════════════════════════════════════════════
-
 require('dotenv').config();
 const { Client, GatewayIntentBits, ActivityType } = require('discord.js');
 const cron = require('node-cron');
@@ -55,12 +51,11 @@ const CHANNELS = {
 // ── Health tracker ────────────────────────────────────────────────
 const botStatus = { startTime: Date.now(), lastRun: {}, errors: {} };
 
-// ── Safe runner — logs ONLY when something real happens ───────────
+// ── Only log these — real data updates, not routine checks ────────
 const LOG_ACTIONS = new Set([
   'Race Results', 'Qualifying Result', 'Sprint Result',
   'Driver Standings', 'Constructor Standings',
-  'Timetable', 'Next Race', 'Race Weekend',
-  'Alerts', 'Bot Status',
+  'Timetable', 'Next Race',
 ]);
 
 async function safeRun(fn, name, ...args) {
@@ -153,8 +148,9 @@ async function runPostSessionUpdates() {
       await safeRun(postTimetable,            'Timetable',             client, CHANNELS.TIMETABLE);
       await safeRun(postNextRace,             'Next Race',             client, CHANNELS.NEXT_RACE);
     } else {
-      await safeRun(checkRaceWeekend, 'Race Weekend', client, CHANNELS.RACE_WEEKEND);
-      await safeRun(postNextRace,     'Next Race',    client, CHANNELS.NEXT_RACE);
+      // Silent — no log for routine post-session refresh
+      try { await checkRaceWeekend(client, CHANNELS.RACE_WEEKEND); } catch {}
+      try { await postNextRace(client, CHANNELS.NEXT_RACE); } catch {}
     }
   }
 }
@@ -205,19 +201,23 @@ client.once('clientReady', async () => {
   await logStartup(client);
   await checkChannelHealth();
 
-  // Boot-time posts
+  // ── Boot-time posts ───────────────────────────────────────────
+  // These log via safeRun since they are real data updates
   await safeRun(postDriverStandings,      'Driver Standings',      client, CHANNELS.DRIVER_STANDINGS);
   await safeRun(postConstructorStandings, 'Constructor Standings', client, CHANNELS.CONSTRUCTOR_STANDINGS);
   await safeRun(postTimetable,            'Timetable',             client, CHANNELS.TIMETABLE);
   await safeRun(postNextRace,             'Next Race',             client, CHANNELS.NEXT_RACE);
-  await safeRun(checkRaceWeekend,         'Race Weekend',          client, CHANNELS.RACE_WEEKEND);
-  await safeRun(postBotStatus,            'Bot Status',            client, CHANNELS.BOT_STATUS, botStatus);
+  // Always post race results on boot — shows last 2 finished races immediately
+  await safeRun(postRaceResults,          'Race Results',          client, CHANNELS.RACE_RESULTS);
 
-  // ════════════════════════════════════════════════════════════
-  // CRON JOBS
-  // ════════════════════════════════════════════════════════════
+  // Silent boot posts — no log needed for these
+  try { await checkRaceWeekend(client, CHANNELS.RACE_WEEKEND); } catch {}
+  try { await postBotStatus(client, CHANNELS.BOT_STATUS, botStatus); } catch {}
 
-  // ① Race result detection — every 5 min, race weekends only
+  // ── CRON JOBS ─────────────────────────────────────────────────
+
+  // ① Race result detection — every 5 min on race weekends only
+  //   Logs when new result found
   cron.schedule('*/5 * * * *', async () => {
     if (!isRaceWeekend()) return;
     const hasNew = await newRaceResultAvailable();
@@ -232,38 +232,60 @@ client.once('clientReady', async () => {
   });
 
   // ② Post-session updates — fires once 3h after each session ends
+  //   Silent — no log unless race triggers safeRun above
   cron.schedule('* * * * *', async () => {
     await runPostSessionUpdates();
   });
 
   // ③ Alerts — every minute on race weekends
+  //   SILENT — alerts.js only logs when alert actually fires
   cron.schedule('* * * * *', async () => {
     if (!isRaceWeekend()) return;
-    await safeRun(checkSessionAlerts, 'Alerts', client, CHANNELS.ALERTS);
+    try {
+      await checkSessionAlerts(client, CHANNELS.ALERTS);
+    } catch (e) {
+      console.error('[Alerts]', e.message);
+      await logAction('❌ **Alerts** failed', e.message.slice(0, 200), true);
+    }
   });
 
-  // ④ Race weekend card — every 5 min during race week (silent, no log)
+  // ④ Race weekend card — every 5 min during race week
+  //   SILENT — no log unless error
   cron.schedule('*/5 * * * *', async () => {
     if (!isRaceWeekend()) return;
-    try { await checkRaceWeekend(client, CHANNELS.RACE_WEEKEND); } catch {}
+    try {
+      await checkRaceWeekend(client, CHANNELS.RACE_WEEKEND);
+    } catch (e) {
+      console.error('[RaceWeekend]', e.message);
+      await logAction('❌ **Race Weekend** failed', e.message.slice(0, 200), true);
+    }
   });
 
-  // ④b Weekly trigger — Monday 6 AM
+  // ④b Monday 6 AM — detect new race week, logs once
   cron.schedule('0 6 * * 1', async () => {
     await safeRun(checkRaceWeekend, 'Race Weekend', client, CHANNELS.RACE_WEEKEND);
   });
 
-  // ⑤ Bot status — every 30 min
+  // ⑤ Bot status — every 30 min, SILENT — no log unless error
   cron.schedule('*/30 * * * *', async () => {
-    await safeRun(postBotStatus, 'Bot Status', client, CHANNELS.BOT_STATUS, botStatus);
+    try {
+      await postBotStatus(client, CHANNELS.BOT_STATUS, botStatus);
+      botStatus.lastRun['Bot Status'] = Date.now();
+    } catch (e) {
+      console.error('[BotStatus]', e.message);
+      await logAction('❌ **Bot Status** failed', e.message.slice(0, 200), true);
+    }
   });
 
   // ⑥ Live race positions — every 10 sec during race weekend
-  //   Only updates Discord when positions actually change
-  //   Stops automatically after race finishes
+  //   SILENT — only updates Discord when positions actually change
   cron.schedule('*/10 * * * * *', async () => {
     if (!isRaceWeekend()) return;
-    await updateRaceLivePosition(client, CHANNELS.RACE_LIVE_POSITION);
+    try {
+      await updateRaceLivePosition(client, CHANNELS.RACE_LIVE_POSITION);
+    } catch (e) {
+      console.error('[LivePosition]', e.message);
+    }
   });
 
   // ⑦ Channel health — every 6 hours
@@ -271,7 +293,7 @@ client.once('clientReady', async () => {
     await checkChannelHealth();
   });
 
-  console.log('✅ All smart cron jobs scheduled.');
+  console.log('✅ All cron jobs scheduled.');
 });
 
 module.exports = { client, CHANNELS, botStatus, safeRun };
